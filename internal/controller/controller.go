@@ -52,20 +52,9 @@ type Controller struct {
 }
 
 // New creates a new deployment tracker controller.
-func New(clientset kubernetes.Interface, namespace string, cfg *Config) (*Controller, error) {
+func New(clientset kubernetes.Interface, namespace string, excludeNamespaces string, cfg *Config) (*Controller, error) {
 	// Create informer factory
-	var factory informers.SharedInformerFactory
-	if namespace == "" {
-		factory = informers.NewSharedInformerFactory(clientset,
-			30*time.Second,
-		)
-	} else {
-		factory = informers.NewSharedInformerFactoryWithOptions(
-			clientset,
-			30*time.Second,
-			informers.WithNamespace(namespace),
-		)
-	}
+	factory := createInformerFactory(clientset, namespace, excludeNamespaces)
 
 	podInformer := factory.Core().V1().Pods().Informer()
 
@@ -486,6 +475,56 @@ func (c *Controller) recordContainer(ctx context.Context, pod *corev1.Pod, conta
 
 func getCacheKey(dn, digest string) string {
 	return dn + "||" + digest
+}
+
+// createInformerFactory creates a shared informer factory with the given resync period.
+// If excludeNamespaces is non-empty, it will exclude those namespaces from being watched.
+// If namespace is non-empty, it will only watch that namespace.
+func createInformerFactory(clientset kubernetes.Interface, namespace string, excludeNamespaces string) informers.SharedInformerFactory {
+	var factory informers.SharedInformerFactory
+	switch {
+	case namespace != "":
+		slog.Info("Namespace to watch",
+			"namespace",
+			namespace,
+		)
+		factory = informers.NewSharedInformerFactoryWithOptions(
+			clientset,
+			30*time.Second,
+			informers.WithNamespace(namespace),
+		)
+	case excludeNamespaces != "":
+		seenNamespaces := make(map[string]bool)
+		fieldSelectorParts := make([]string, 0)
+
+		for _, ns := range strings.Split(excludeNamespaces, ",") {
+			ns = strings.TrimSpace(ns)
+			if ns != "" && !seenNamespaces[ns] {
+				seenNamespaces[ns] = true
+				fieldSelectorParts = append(fieldSelectorParts, fmt.Sprintf("metadata.namespace!=%s", ns))
+			}
+		}
+
+		slog.Info("Excluding namespaces from watch",
+			"field_selector",
+			strings.Join(fieldSelectorParts, ","),
+		)
+		tweakListOptions := func(options *metav1.ListOptions) {
+			options.FieldSelector = strings.Join(fieldSelectorParts, ",")
+		}
+
+		factory = informers.NewSharedInformerFactoryWithOptions(
+			clientset,
+			30*time.Second,
+			informers.WithTweakListOptions(tweakListOptions),
+		)
+	default:
+		factory = informers.NewSharedInformerFactory(clientset,
+			30*time.Second,
+		)
+	}
+
+	return factory
 }
 
 // getARDeploymentName converts the pod's metadata into the correct format
